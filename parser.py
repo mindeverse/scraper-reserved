@@ -1,74 +1,15 @@
-"""Reserved parser — scrape arch listing API, parse products."""
+"""Reserved product parser — parse arch API product data into Supabase schema."""
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 import re
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
-from urllib.parse import urljoin
-
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from config import cfg
 
 logger = logging.getLogger(__name__)
-
-BACK_KEYWORDS = ("back", "rear", "_b.", "_back", "-back", "backview", "back_view")
-
-# Shared session with connection pooling and retry strategy
-_session: requests.Session | None = None
-_session_lock = threading.Lock()
-
-
-def _get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        with _session_lock:
-            if _session is None:
-                _session = requests.Session()
-                retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-                adapter = HTTPAdapter(
-                    max_retries=retry,
-                    pool_connections=cfg.SCRAPE_WORKERS,
-                    pool_maxsize=cfg.SCRAPE_WORKERS,
-                )
-                _session.mount("https://", adapter)
-                _session.mount("http://", adapter)
-                _session.headers.update(_headers())
-    return _session
-
-
-def _headers() -> dict[str, str]:
-    return {
-        "User-Agent": cfg.USER_AGENT,
-        "Accept": "application/json,text/html,*/*",
-        "Accept-Language": "en-IE,en;q=0.9",
-    }
-
-
-# Semaphore to control concurrent requests to a single domain
-_request_semaphore = threading.Semaphore(cfg.SCRAPE_WORKERS)
-_last_request_time = 0.0
-_rate_lock = threading.Lock()
-
-
-def _rate_limited_get(url: str, timeout: int = 30) -> requests.Response:
-    """Get with per-domain rate limiting and connection pooling."""
-    global _last_request_time
-    with _request_semaphore:
-        with _rate_lock:
-            elapsed = time.monotonic() - _last_request_time
-            if elapsed < cfg.RATE_LIMIT_DELAY:
-                time.sleep(cfg.RATE_LIMIT_DELAY - elapsed)
-            _last_request_time = time.monotonic()
-        session = _get_session()
-        return session.get(url, timeout=timeout)
 
 
 def _stable_id(product_url: str) -> str:
@@ -85,59 +26,6 @@ def _money(amount: Optional[float | int | str], currency: str | None = None) -> 
     except (TypeError, ValueError):
         return None
     return f"{val:.2f}{currency}"
-
-
-def _parse_price_value(raw: Any) -> Optional[float]:
-    if raw is None or raw == "":
-        return None
-    try:
-        if isinstance(raw, str):
-            return float(raw)
-        raw_f = float(raw)
-        if isinstance(raw, int) and raw_f >= 100:
-            return raw_f / 100.0
-        return raw_f
-    except (TypeError, ValueError):
-        return None
-
-
-def _detect_back_image(images: dict[str, Any], front_src: str) -> Optional[str]:
-    """Detect back image from the images dict."""
-    for size_key in ["1200", "850"]:
-        if size_key in images:
-            back = images[size_key].get("back", "")
-            if back and back != front_src:
-                return back
-    return None
-
-
-def _normalize_url(url: str) -> str:
-    if not url:
-        return ""
-    if url.startswith("//"):
-        return f"https:{url}"
-    if url.startswith("/"):
-        return urljoin(cfg.BASE_URL + "/", url)
-    return url
-
-
-def _category_from_url(url: str) -> str:
-    """Extract category name from URL path."""
-    parts = url.rstrip("/").split("/")
-    for i, part in enumerate(parts):
-        if part in ("men", "women") and i + 1 < len(parts):
-            category = parts[i + 1]
-            return cfg.CATEGORY_DISPLAY.get(category, category.replace("-", " ").title())
-    return "Other"
-
-
-def _infer_gender(url: str) -> Optional[str]:
-    """Infer gender from URL path."""
-    if "/men/" in url:
-        return "Men"
-    if "/women/" in url:
-        return "Women"
-    return cfg.GENDER_DEFAULT
 
 
 def _extract_price_info(product: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -330,7 +218,7 @@ def _extract_tags(product: dict[str, Any]) -> list[str]:
     return tags if tags else None
 
 
-def parse_product(raw: dict[str, Any], category_url: str = "") -> Optional[dict[str, Any]]:
+def parse_product(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Parse a raw arch API product into the Supabase products schema."""
     product_url = raw.get("url", "")
     if not product_url:
@@ -347,11 +235,9 @@ def parse_product(raw: dict[str, Any], category_url: str = "") -> Optional[dict[
 
     price, sale = _extract_price_info(raw)
     size = _extract_sizes(raw)
-    gender = _infer_gender(category_url) if category_url else raw.get("_gender", "")
-    category = _category_from_url(category_url) if category_url else None
+    gender = raw.get("_gender", "")
     categories = raw.get("_categories", [])
-    if categories:
-        category = ", ".join(categories)
+    category = ", ".join(categories) if categories else None
 
     metadata = _extract_metadata(raw)
     tags = _extract_tags(raw)
@@ -383,99 +269,3 @@ def parse_product(raw: dict[str, Any], category_url: str = "") -> Optional[dict[
         "additional_images": additional_images,
         "other": None,
     }
-
-
-def fetch_category_products(category_url: str) -> list[dict[str, Any]]:
-    """Fetch products for a category using the arch API."""
-    # Extract category ID from URL
-    # Reserved URLs look like: /ie/en/men/shirts/view-all
-    # We need to find the category ID from the arch API
-    products: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    # First, try to get category listing from arch API
-    # The arch API endpoint pattern is: /api/v2/{store_id}/categories/{category_id}/products
-    # We need to discover category IDs first
-
-    # For now, scrape the webpage directly
-    try:
-        resp = _rate_limited_get(category_url, timeout=cfg.REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Extract product data from HTML/JSON
-        # Reserved embeds product data in script tags
-        product_pattern = r'window\.__PRODUCT_DATA__\s*=\s*({.*?});'
-        match = re.search(product_pattern, html, re.DOTALL)
-
-        if match:
-            try:
-                product_data = json.loads(match.group(1))
-                if isinstance(product_data, list):
-                    for raw_product in product_data:
-                        parsed = parse_product(raw_product, category_url)
-                        if parsed and parsed["product_url"] not in seen:
-                            seen.add(parsed["product_url"])
-                            products.append(parsed)
-            except json.JSONDecodeError:
-                pass
-
-        # Also try to find product URLs in the HTML
-        url_pattern = r'href="(/ie/en/[^"]+/p_[^"]+)"'
-        product_urls = re.findall(url_pattern, html)
-
-        for url_path in product_urls:
-            full_url = f"https://www.reserved.com{url_path}"
-            if full_url not in seen:
-                # Create a minimal product entry
-                product = {
-                    "url": full_url,
-                    "name": url_path.split("/")[-2].replace("-", " ").title(),
-                }
-                parsed = parse_product(product, category_url)
-                if parsed:
-                    seen.add(full_url)
-                    products.append(parsed)
-
-    except Exception as e:
-        logger.warning("Failed to fetch category %s: %s", category_url, e)
-
-    logger.info("Category %s: %d products", category_url.split("/")[-1], len(products))
-    return products
-
-
-def scrape_all_categories() -> list[dict[str, Any]]:
-    """Scrape all categories in parallel."""
-    all_products: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    with ThreadPoolExecutor(max_workers=cfg.SCRAPE_WORKERS) as executor:
-        future_to_url = {
-            executor.submit(fetch_category_products, url): url
-            for url in cfg.CATEGORY_URLS
-        }
-
-        for future in future_to_url:
-            url = future_to_url[future]
-            try:
-                cat_products = future.result()
-                for p in cat_products:
-                    if p["product_url"] not in seen:
-                        seen.add(p["product_url"])
-                        all_products.append(p)
-                    else:
-                        # Merge categories
-                        existing = next(
-                            (x for x in all_products if x["product_url"] == p["product_url"]),
-                            None,
-                        )
-                        if existing:
-                            cats = {c.strip() for c in (existing.get("category") or "").split(",") if c.strip()}
-                            if p.get("category"):
-                                cats.add(p["category"])
-                            existing["category"] = ", ".join(sorted(cats)) if cats else existing.get("category")
-            except Exception as e:
-                logger.error("Category %s crawl failed: %s", url, e)
-
-    logger.info("Total unique products: %d", len(all_products))
-    return all_products
