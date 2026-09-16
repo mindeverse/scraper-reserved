@@ -13,7 +13,6 @@ from typing import Any
 
 from config import cfg
 from embeddings import embed_products
-from parser import parse_product
 from scraper import scrape_all_categories
 from supabase_client import (
     SupabaseClient,
