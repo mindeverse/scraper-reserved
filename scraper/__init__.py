@@ -1,25 +1,35 @@
-"""Reserved arch API scraper — discover categories and fetch products."""
+"""Reserved Algolia API scraper — fetch all products via Algolia search."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
-from urllib.parse import urljoin
+from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import cfg
-from parser import parse_product
 
 logger = logging.getLogger(__name__)
 
-# Shared session
+ALGOLIA_APP_ID = "4DBLBFMEJV"
+ALGOLIA_SEARCH_KEY = "e97ce435b768f0fa7048e25a7cf3752e"
+ALGOLIA_INDEX = "PRODUCT_RES_IE_EN"
+ALGOLIA_URL = f"https://{ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
+
+ALGOLIA_ATTRIBUTES = [
+    "id", "store_id", "sku", "name", "description", "final_price",
+    "final_price_type", "currency", "url", "color_options",
+    "categories_list", "color", "sizes", "season", "line",
+    "collection_name", "merchant", "blocked", "rms_department_name",
+    "rms_class_name", "rms_subclass_name",
+]
+
 _session: requests.Session | None = None
 _session_lock = threading.Lock()
 
@@ -33,265 +43,182 @@ def _get_session() -> requests.Session:
                 retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
                 adapter = HTTPAdapter(
                     max_retries=retry,
-                    pool_connections=cfg.SCRAPE_WORKERS,
-                    pool_maxsize=cfg.SCRAPE_WORKERS,
+                    pool_connections=4,
+                    pool_maxsize=4,
                 )
                 _session.mount("https://", adapter)
                 _session.mount("http://", adapter)
                 _session.headers.update({
-                    "User-Agent": cfg.USER_AGENT,
-                    "Accept": "application/json,text/html,*/*",
-                    "Accept-Language": "en-IE,en;q=0.9",
+                    "X-Algolia-Application-Id": ALGOLIA_APP_ID,
+                    "X-Algolia-API-Key": ALGOLIA_SEARCH_KEY,
+                    "Content-Type": "application/json",
                 })
     return _session
 
 
-def _rate_limited_get(url: str, timeout: int = 30) -> requests.Response:
-    """Get with rate limiting."""
-    time.sleep(cfg.RATE_LIMIT_DELAY)
+def _algolia_query(body: dict) -> dict:
     session = _get_session()
-    return session.get(url, timeout=timeout)
+    time.sleep(cfg.RATE_LIMIT_DELAY)
+    resp = session.post(ALGOLIA_URL, json=body, timeout=cfg.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def discover_all_category_ids() -> dict[str, int]:
-    """Discover category IDs from Reserved arch API.
-    
-    Returns dict mapping category URL to category ID.
-    """
-    category_ids: dict[str, int] = {}
-    
-    for category_url in cfg.CATEGORY_URLS:
-        try:
-            # Try to get category ID from the arch API
-            # The arch API has a categories endpoint
-            resp = _rate_limited_get(
-                f"{cfg.ARCH_API_BASE}/v2/{cfg.STORE_ID}/categories",
-                timeout=cfg.REQUEST_TIMEOUT
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    for cat in data:
-                        if "id" in cat and "url" in cat:
-                            cat_url = cat.get("url", "")
-                            cat_id = cat.get("id")
-                            if cat_url and cat_id:
-                                category_ids[cat_url] = cat_id
-        except Exception as e:
-            logger.warning("Failed to discover category ID for %s: %s", category_url, e)
-    
-    # If arch API discovery failed, try to extract from webpage
-    if not category_ids:
-        logger.info("Arch API discovery failed, trying webpage extraction...")
-        for category_url in cfg.CATEGORY_URLS:
-            try:
-                resp = _rate_limited_get(category_url, timeout=cfg.REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                html = resp.text
-                
-                # Look for category ID in script tags or data attributes
-                patterns = [
-                    r'"categoryId"\s*:\s*(\d+)',
-                    r'data-category-id="(\d+)"',
-                    r'category_id["\s:=]+(\d+)',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, html)
-                    if match:
-                        cat_id = int(match.group(1))
-                        category_ids[category_url] = cat_id
-                        break
-            except Exception as e:
-                logger.warning("Failed to extract category ID from %s: %s", category_url, e)
-    
-    logger.info("Discovered %d category IDs", len(category_ids))
-    return category_ids
+def _get_all_subcategories() -> dict[str, int]:
+    data = _algolia_query({
+        "query": "",
+        "hitsPerPage": 0,
+        "facets": ["categories.lvl1"],
+        "maxValuesPerFacet": 200,
+    })
+    return data.get("facets", {}).get("categories.lvl1", {})
 
 
-def fetch_category_products_from_arch(category_id: int, category_url: str) -> list[dict[str, Any]]:
-    """Fetch products for a category using the arch API."""
-    products: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    page = 1
-    page_size = cfg.PRODUCTS_JSON_LIMIT
-    
+def _fetch_subcategory_products(subcat: str) -> list[dict[str, Any]]:
+    all_hits = []
+    last_id = 0
+
     while True:
-        try:
-            url = f"{cfg.ARCH_API_BASE}/v2/{cfg.STORE_ID}/categories/{category_id}/products"
-            params = {"page": page, "limit": page_size}
-            resp = _rate_limited_get(url, timeout=cfg.REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            if not data:
-                break
-            
-            batch = data if isinstance(data, list) else data.get("products", [])
-            if not batch:
-                break
-            
-            for raw_product in batch:
-                # Add metadata from scraper
-                raw_product["_gender"] = _infer_gender(category_url)
-                raw_product["_categories"] = [_category_from_url(category_url)]
-                parsed = parse_product(raw_product)
-                if parsed and parsed["product_url"] not in seen:
-                    seen.add(parsed["product_url"])
-                    products.append(parsed)
-            
-            if len(batch) < page_size:
-                break
-            page += 1
-            
-        except Exception as e:
-            logger.warning("Failed to fetch products for category %d page %d: %s", category_id, page, e)
+        body = {
+            "query": "",
+            "hitsPerPage": 1000,
+            "page": 0,
+            "facetFilters": [[f"categories.lvl1:{subcat}"]],
+            "numericFilters": [f"id > {last_id}"],
+            "attributesToRetrieve": ALGOLIA_ATTRIBUTES,
+        }
+        data = _algolia_query(body)
+        hits = data.get("hits", [])
+        if not hits:
             break
-    
-    return products
+
+        all_hits.extend(hits)
+        last_id = max(h["id"] for h in hits)
+
+        if len(hits) < 1000:
+            break
+
+    return all_hits
 
 
-def _infer_gender(url: str) -> str:
-    """Infer gender from URL path."""
-    if "/men/" in url:
-        return "Men"
-    if "/women/" in url:
-        return "Women"
-    return cfg.GENDER_DEFAULT
+def _parse_algolia_hit(hit: dict[str, Any]) -> dict[str, Any] | None:
+    product_url = hit.get("url", "")
+    if not product_url:
+        return None
 
+    name = (hit.get("name") or "").strip()
+    if not name:
+        return None
 
-def _category_from_url(url: str) -> str:
-    """Extract category name from URL path."""
-    parts = url.rstrip("/").split("/")
-    for i, part in enumerate(parts):
-        if part in ("men", "women") and i + 1 < len(parts):
-            category = parts[i + 1]
-            return cfg.CATEGORY_DISPLAY.get(category, category.replace("-", " ").title())
-    return "Other"
+    sku = hit.get("sku", "")
+    final_price = hit.get("final_price")
+    currency = hit.get("currency", cfg.CURRENCY)
+
+    price_str = None
+    if final_price:
+        price_str = f"{float(final_price):.2f}{currency}"
+
+    image_url = ""
+    back_image_url = None
+    compressed_image_url = None
+    color_options = hit.get("color_options") or []
+
+    if isinstance(color_options, list) and color_options:
+        first_opt = color_options[0]
+        if isinstance(first_opt, dict):
+            color_obj = first_opt.get("color") or {}
+            image_url = color_obj.get("photo", "")
+
+    if image_url:
+        hi_res = image_url.replace("/cache/40/", "/cache/1200/")
+        if hi_res != image_url:
+            compressed_image_url = image_url
+            image_url = hi_res
+
+    categories = hit.get("categories_list") or []
+    category = ", ".join(categories) if categories else None
+
+    gender = ""
+    categories_lower = " ".join(categories).lower()
+    if "women" in categories_lower or "ladies" in categories_lower:
+        gender = "Women"
+    elif "men" in categories_lower or "gentlemen" in categories_lower:
+        gender = "Men"
+
+    size_list = hit.get("sizes") or []
+    available_sizes = []
+    if isinstance(size_list, list):
+        for s in size_list:
+            if isinstance(s, dict) and s.get("stock") and s.get("sizeName"):
+                available_sizes.append(s["sizeName"])
+            elif isinstance(s, str) and s.strip():
+                available_sizes.append(s.strip())
+    size_str = ", ".join(available_sizes) if available_sizes else None
+
+    metadata = {
+        "sku": sku,
+        "color": hit.get("color", ""),
+        "season": hit.get("season", ""),
+        "line": hit.get("line", ""),
+        "collection_name": hit.get("collection_name", ""),
+        "department": hit.get("rms_department_name", ""),
+        "class_name": hit.get("rms_class_name", ""),
+        "subclass_name": hit.get("rms_subclass_name", ""),
+    }
+
+    description = hit.get("description")
+    if description:
+        description = re.sub(r"<[^>]+>", " ", description)
+        description = re.sub(r"\s+", " ", description).strip() or None
+
+    prod_id = hashlib.sha256(f"{cfg.SOURCE}:{product_url}".encode()).hexdigest()[:24]
+
+    return {
+        "id": f"reserved_{prod_id}",
+        "source": cfg.SOURCE,
+        "product_url": product_url,
+        "affiliate_url": None,
+        "image_url": image_url or None,
+        "compressed_image_url": compressed_image_url,
+        "back_image_url": back_image_url,
+        "brand": cfg.BRAND_COLUMN,
+        "title": name,
+        "description": description,
+        "category": category,
+        "gender": gender,
+        "price": price_str,
+        "sale": None,
+        "metadata": json.dumps(metadata, ensure_ascii=False) if any(metadata.values()) else None,
+        "size": size_str,
+        "second_hand": cfg.SECOND_HAND,
+        "country": "IE",
+        "tags": None,
+        "additional_images": None,
+        "other": None,
+    }
 
 
 def scrape_all_categories() -> list[dict[str, Any]]:
-    """Scrape all categories using the arch API."""
     all_products: list[dict[str, Any]] = []
     seen: set[str] = set()
-    
-    # First, try to discover category IDs
-    category_ids = discover_all_category_ids()
-    
-    if category_ids:
-        # Use arch API with discovered category IDs
-        with ThreadPoolExecutor(max_workers=cfg.SCRAPE_WORKERS) as executor:
-            future_to_url = {}
-            for category_url, category_id in category_ids.items():
-                future = executor.submit(
-                    fetch_category_products_from_arch,
-                    category_id,
-                    category_url
-                )
-                future_to_url[future] = category_url
-            
-            for future in future_to_url:
-                url = future_to_url[future]
-                try:
-                    cat_products = future.result()
-                    for product in cat_products:
-                        product_url = product.get("url", "")
-                        if product_url and product_url not in seen:
-                            seen.add(product_url)
-                            all_products.append(product)
-                except Exception as e:
-                    logger.error("Category %s crawl failed: %s", url, e)
-    else:
-        # Fallback: scrape webpages directly
-        logger.info("No category IDs discovered, falling back to webpage scraping...")
-        with ThreadPoolExecutor(max_workers=cfg.SCRAPE_WORKERS) as executor:
-            future_to_url = {
-                executor.submit(_scrape_webpage, url): url
-                for url in cfg.CATEGORY_URLS
-            }
-            
-            for future in future_to_url:
-                url = future_to_url[future]
-                try:
-                    cat_products = future.result()
-                    for product in cat_products:
-                        product_url = product.get("url", "")
-                        if product_url and product_url not in seen:
-                            seen.add(product_url)
-                            all_products.append(product)
-                except Exception as e:
-                    logger.error("Category %s crawl failed: %s", url, e)
-    
-    logger.info("Total unique products: %d", len(all_products))
+
+    logger.info("Fetching subcategory list from Algolia...")
+    subcats = _get_all_subcategories()
+    logger.info("Found %d subcategories", len(subcats))
+
+    for subcat, count in sorted(subcats.items(), key=lambda x: -x[1]):
+        logger.info("Fetching %s (%d products)...", subcat, count)
+        hits = _fetch_subcategory_products(subcat)
+
+        new_count = 0
+        for hit in hits:
+            parsed = _parse_algolia_hit(hit)
+            if parsed and parsed["product_url"] not in seen:
+                seen.add(parsed["product_url"])
+                all_products.append(parsed)
+                new_count += 1
+
+        logger.info("  -> %d hits, %d new unique products", len(hits), new_count)
+
+    logger.info("Total unique products scraped: %d", len(all_products))
     return all_products
-
-
-def _scrape_webpage(category_url: str) -> list[dict[str, Any]]:
-    """Fallback: scrape products from webpage HTML."""
-    products: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    
-    try:
-        resp = _rate_limited_get(category_url, timeout=cfg.REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        html = resp.text
-        
-        # Extract product URLs from HTML
-        # Reserved product URLs typically look like: /ie/en/.../p_XXXXX.html
-        url_pattern = r'href="(/ie/en/[^"]+/p_[^"]+\.html)"'
-        product_urls = re.findall(url_pattern, html)
-        
-        for url_path in product_urls:
-            full_url = f"https://www.reserved.com{url_path}"
-            if full_url not in seen:
-                seen.add(full_url)
-                # Create minimal product entry
-                # Extract name from URL
-                name_part = url_path.split("/")[-2] if "/" in url_path else url_path.split("/")[-1]
-                name = name_part.replace("-", " ").replace("_", " ").title()
-                # Remove p_ prefix if present
-                if name.startswith("P "):
-                    name = name[2:]
-                
-                product = {
-                    "url": full_url,
-                    "name": name,
-                    "_gender": _infer_gender(category_url),
-                    "_categories": [_category_from_url(category_url)],
-                }
-                parsed = parse_product(product)
-                if parsed:
-                    products.append(parsed)
-        
-        # Also try to extract product data from JSON-LD or script tags
-        json_patterns = [
-            r'window\.__PRODUCT_DATA__\s*=\s*({.*?});',
-            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-        ]
-        for pattern in json_patterns:
-            matches = re.findall(pattern, html, re.DOTALL)
-            for match in matches:
-                try:
-                    data = json.loads(match)
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and "url" in item:
-                                item["_gender"] = _infer_gender(category_url)
-                                item["_categories"] = [_category_from_url(category_url)]
-                                parsed = parse_product(item)
-                                if parsed and parsed["product_url"] not in seen:
-                                    seen.add(parsed["product_url"])
-                                    products.append(parsed)
-                    elif isinstance(data, dict) and "url" in data:
-                        data["_gender"] = _infer_gender(category_url)
-                        data["_categories"] = [_category_from_url(category_url)]
-                        parsed = parse_product(data)
-                        if parsed and parsed["product_url"] not in seen:
-                            seen.add(parsed["product_url"])
-                            products.append(parsed)
-                except json.JSONDecodeError:
-                    pass
-        
-    except Exception as e:
-        logger.warning("Failed to scrape webpage %s: %s", category_url, e)
-    
-    return products
